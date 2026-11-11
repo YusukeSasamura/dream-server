@@ -1,1 +1,1 @@
-index.html en.html style.css icon.svg patch_give.py patch_freud.py patch_breaks.py patch_how.py patch_title.py patch_copy.py patch_howslide.py
+index.html en.html style.css icon.svg patch_give.py patch_freud.py patch_breaks.py patch_how.py patch_title.py patch_copy.py patch_howslide.py patch_wave.py
