@@ -71,6 +71,10 @@ def init():
             c.execute("ALTER TABLE entries ADD COLUMN links TEXT NOT NULL DEFAULT '[]'")
         if "dayinfo" not in cols:
             c.execute("ALTER TABLE entries ADD COLUMN dayinfo TEXT NOT NULL DEFAULT '{}'")
+        if "nationality" not in cols:
+            c.execute("ALTER TABLE entries ADD COLUMN nationality TEXT NOT NULL DEFAULT ''")
+        if "lang" not in cols:
+            c.execute("ALTER TABLE entries ADD COLUMN lang TEXT NOT NULL DEFAULT ''")
 
 
 def clean_links(items):
@@ -173,7 +177,7 @@ def summary(q):
 
 # ---- Admin export (token required). Rows carry no dream text, names or IPs; the install ID is
 # replaced by a one-way pseudonym so exported files can't be matched back to a device.
-EXPORT_KINDS = ("entries", "daily", "words", "feelings", "countries", "demographics", "links", "days")
+EXPORT_KINDS = ("entries", "daily", "words", "feelings", "countries", "nationalities", "languages", "demographics", "links", "days")
 
 
 def pseudo(dev):
@@ -182,14 +186,14 @@ def pseudo(dev):
 
 def export_rows(kind, start, end):
     with db() as c:
-        rows = c.execute("SELECT device, day, country, age, gender, words, feelings, links, dayinfo, created FROM entries "
+        rows = c.execute("SELECT device, day, country, nationality, lang, age, gender, words, feelings, links, dayinfo, created FROM entries "
                          "WHERE day BETWEEN ? AND ? ORDER BY day, device", (start, end)).fetchall()
     if kind == "entries":
-        yield ["day", "person", "country", "age", "gender", "words", "feelings", "links"] + sorted(DAY_KEYS)
+        yield ["day", "person", "country", "nationality", "lang", "age", "gender", "words", "feelings", "links"] + sorted(DAY_KEYS)
         for r in rows:
             di = json.loads(r["dayinfo"] or "{}")
             links = " / ".join(f'{l["kind"]}:{l["days"]}d' + (f':{l["word"]}' if l["word"] else "") for l in json.loads(r["links"] or "[]"))
-            yield [r["day"], pseudo(r["device"]), r["country"], r["age"], r["gender"],
+            yield [r["day"], pseudo(r["device"]), r["country"], r["nationality"], r["lang"], r["age"], r["gender"],
                    " / ".join(json.loads(r["words"])), " ".join(json.loads(r["feelings"])), links] + \
                   [" ".join(di[k]) if isinstance(di.get(k), list) else di.get(k, "") for k in sorted(DAY_KEYS)]
         return
@@ -240,27 +244,29 @@ def export_rows(kind, start, end):
             ppl = days[day]["people"]
             yield [day, days[day]["dreams"], len(ppl), sum(1 for p in ppl if first.get(p) == day)]
         return
-    if kind in ("words", "feelings", "countries"):
+    if kind in ("words", "feelings", "countries", "nationalities", "languages"):
         people, dreams = {}, {}
         for r in rows:
             vals = (set(json.loads(r["words"])) if kind == "words" else
                     set(json.loads(r["feelings"])) if kind == "feelings" else
-                    ({r["country"]} if r["country"] else set()))
+                    ({r["country"]} if r["country"] else set()) if kind == "countries" else
+                    ({r["nationality"]} if r["nationality"] else set()) if kind == "nationalities" else
+                    ({r["lang"]} if r["lang"] else set()))
             for v in vals:
                 people.setdefault(v, set()).add(r["device"]); dreams[v] = dreams.get(v, 0) + 1
         total = len({r["device"] for r in rows}) or 1
-        yield [{"words": "word", "feelings": "feeling", "countries": "country"}[kind], "people", "dreams", "share_of_people"]
+        yield [{"words": "word", "feelings": "feeling", "countries": "country", "nationalities": "nationality", "languages": "language"}[kind], "people", "dreams", "share_of_people"]
         for v, p in sorted(people.items(), key=lambda kv: -len(kv[1])):
             yield [v, len(p), dreams[v], round(len(p) / total, 4)]
         return
     if kind == "demographics":
         groups = {}
         for r in rows:
-            g = groups.setdefault((r["age"] or "-", r["gender"] or "-"), {"people": set(), "dreams": 0})
+            g = groups.setdefault((r["age"] or "-", r["gender"] or "-", r["nationality"] or "-"), {"people": set(), "dreams": 0})
             g["people"].add(r["device"]); g["dreams"] += 1
-        yield ["age", "gender", "people", "dreams"]
-        for (a, g), v in sorted(groups.items()):
-            yield [a, g, len(v["people"]), v["dreams"]]
+        yield ["age", "gender", "nationality", "people", "dreams"]
+        for (a, g, n), v in sorted(groups.items()):
+            yield [a, g, n, len(v["people"]), v["dreams"]]
 
 
 def overview():
@@ -377,15 +383,19 @@ class H(BaseHTTPRequestHandler):
             country = country if re.fullmatch(r"[A-Z]{2}", country) else ""
             age = b.get("age", "") if b.get("age", "") in AGES else ""
             gender = b.get("gender", "") if b.get("gender", "") in GENDERS else ""
+            nationality = str(b.get("nationality", "")).upper()
+            nationality = nationality if re.fullmatch(r"[A-Z]{2}", nationality) else ""
+            lang = str(b.get("lang", "")).lower()
+            lang = lang if re.fullmatch(r"[a-z]{2}", lang) else ""
             words = [w for w in (clean_word(x) for x in (b.get("words") or [])[:8]) if w][:6]
             feelings = [f for f in (b.get("feelings") or [])[:5] if f in FEELINGS][:3]
             links = clean_links(b.get("links"))
             dayinfo = clean_day(b.get("dayinfo"))
             with db() as c:
-                c.execute("INSERT OR REPLACE INTO entries(device, day, country, age, gender, words, feelings, created, links, dayinfo) "
-                          "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                c.execute("INSERT OR REPLACE INTO entries(device, day, country, age, gender, words, feelings, created, links, dayinfo, nationality, lang) "
+                          "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                           (dev, day, country, age, gender, json.dumps(words, ensure_ascii=False), json.dumps(feelings), int(time.time()),
-                           json.dumps(links, ensure_ascii=False), json.dumps(dayinfo)))
+                           json.dumps(links, ensure_ascii=False), json.dumps(dayinfo), nationality, lang))
             return self.send(200, {"ok": True})
         if u.path == "/v1/forget":
             dev = self.device(b.get("device"))
