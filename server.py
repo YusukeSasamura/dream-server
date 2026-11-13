@@ -7,7 +7,7 @@ at least K different people; smaller groups are withheld.
 
 Standard library only. Listens on 127.0.0.1; put Caddy or nginx in front for HTTPS.
 """
-import json, os, re, sqlite3, threading, time, uuid
+import csv, hashlib, hmac, io, json, os, re, sqlite3, threading, time, uuid
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -16,6 +16,7 @@ DB = os.environ.get("DREAM_DB", "/var/lib/dream-server/dream.db")
 PORT = int(os.environ.get("DREAM_PORT", "8787"))
 K = int(os.environ.get("DREAM_MIN_PEOPLE", "10"))
 ADMIN_TOKEN = os.environ.get("DREAM_ADMIN_TOKEN", "")
+ADMIN_ORIGIN = os.environ.get("DREAM_ADMIN_ORIGIN", "https://iwakeupeverymorninginordertodream.com")
 
 AGES = {"", "10s", "20s", "30s", "40s", "50s+"}
 GENDERS = {"", "f", "m", "x"}
@@ -108,6 +109,71 @@ def summary(q):
     return out
 
 
+# ---- Admin export (token required). Rows carry no dream text, names or IPs; the install ID is
+# replaced by a one-way pseudonym so exported files can't be matched back to a device.
+EXPORT_KINDS = ("entries", "daily", "words", "feelings", "countries", "demographics")
+
+
+def pseudo(dev):
+    return hmac.new(ADMIN_TOKEN.encode(), dev.encode(), hashlib.sha256).hexdigest()[:12]
+
+
+def export_rows(kind, start, end):
+    with db() as c:
+        rows = c.execute("SELECT device, day, country, age, gender, words, feelings, created FROM entries "
+                         "WHERE day BETWEEN ? AND ? ORDER BY day, device", (start, end)).fetchall()
+    if kind == "entries":
+        yield ["day", "person", "country", "age", "gender", "words", "feelings"]
+        for r in rows:
+            yield [r["day"], pseudo(r["device"]), r["country"], r["age"], r["gender"],
+                   " / ".join(json.loads(r["words"])), " ".join(json.loads(r["feelings"]))]
+        return
+    if kind == "daily":
+        first = {}
+        with db() as c:
+            for r in c.execute("SELECT device, MIN(day) AS d FROM entries GROUP BY device"):
+                first[r["device"]] = r["d"]
+        days = {}
+        for r in rows:
+            d = days.setdefault(r["day"], {"dreams": 0, "people": set()})
+            d["dreams"] += 1; d["people"].add(r["device"])
+        yield ["day", "dreams", "people", "new_people"]
+        for day in sorted(days):
+            ppl = days[day]["people"]
+            yield [day, days[day]["dreams"], len(ppl), sum(1 for p in ppl if first.get(p) == day)]
+        return
+    if kind in ("words", "feelings", "countries"):
+        people, dreams = {}, {}
+        for r in rows:
+            vals = (set(json.loads(r["words"])) if kind == "words" else
+                    set(json.loads(r["feelings"])) if kind == "feelings" else
+                    ({r["country"]} if r["country"] else set()))
+            for v in vals:
+                people.setdefault(v, set()).add(r["device"]); dreams[v] = dreams.get(v, 0) + 1
+        total = len({r["device"] for r in rows}) or 1
+        yield [{"words": "word", "feelings": "feeling", "countries": "country"}[kind], "people", "dreams", "share_of_people"]
+        for v, p in sorted(people.items(), key=lambda kv: -len(kv[1])):
+            yield [v, len(p), dreams[v], round(len(p) / total, 4)]
+        return
+    if kind == "demographics":
+        groups = {}
+        for r in rows:
+            g = groups.setdefault((r["age"] or "-", r["gender"] or "-"), {"people": set(), "dreams": 0})
+            g["people"].add(r["device"]); g["dreams"] += 1
+        yield ["age", "gender", "people", "dreams"]
+        for (a, g), v in sorted(groups.items()):
+            yield [a, g, len(v["people"]), v["dreams"]]
+
+
+def overview():
+    with db() as c:
+        r = c.execute("SELECT COUNT(*) AS dreams, COUNT(DISTINCT device) AS people, MIN(day) AS first, MAX(day) AS last FROM entries").fetchone()
+        week = (date.today() - timedelta(days=6)).isoformat()
+        w = c.execute("SELECT COUNT(*) AS dreams, COUNT(DISTINCT device) AS people FROM entries WHERE day >= ?", (week,)).fetchone()
+    return {"dreams": r["dreams"], "people": r["people"], "first_day": r["first"], "last_day": r["last"],
+            "last7_dreams": w["dreams"], "last7_people": w["people"], "k_public": K}
+
+
 class H(BaseHTTPRequestHandler):
     server_version = "dream/1"
 
@@ -117,7 +183,38 @@ class H(BaseHTTPRequestHandler):
     def send(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
+        self.cors()
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def admin_ok(self):
+        return bool(ADMIN_TOKEN) and hmac.compare_digest(self.headers.get("X-Admin-Token", ""), ADMIN_TOKEN)
+
+    def cors(self):
+        if self.headers.get("Origin") == ADMIN_ORIGIN:
+            self.send_header("Access-Control-Allow-Origin", ADMIN_ORIGIN)
+            self.send_header("Access-Control-Allow-Headers", "X-Admin-Token")
+            self.send_header("Access-Control-Expose-Headers", "Content-Disposition")
+            self.send_header("Vary", "Origin")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.cors()
+        self.send_header("Access-Control-Allow-Methods", "GET")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def send_csv(self, name, rows):
+        buf = io.StringIO()
+        csv.writer(buf).writerows(rows)
+        body = ("\ufeff" + buf.getvalue()).encode()
+        self.send_response(200)
+        self.cors()
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{name}"')
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -146,6 +243,23 @@ class H(BaseHTTPRequestHandler):
             if limited(self.ip(), 120):
                 return self.send(429, {"error": "slow down"})
             return self.send(200, summary(parse_qs(u.query)))
+        if u.path.startswith("/v1/admin/"):
+            if limited(self.ip(), 30):
+                return self.send(429, {"error": "slow down"})
+            if not self.admin_ok():
+                return self.send(403, {"error": "forbidden"})
+            if u.path == "/v1/admin/overview":
+                return self.send(200, overview())
+            if u.path == "/v1/admin/export":
+                q = parse_qs(u.query)
+                kind = (q.get("kind") or ["entries"])[0]
+                if kind not in EXPORT_KINDS:
+                    return self.send(400, {"error": "kind must be one of " + ", ".join(EXPORT_KINDS)})
+                start = (q.get("from") or ["2000-01-01"])[0]
+                end = (q.get("to") or [date.today().isoformat()])[0]
+                if not (re.fullmatch(r"\d{4}-\d{2}-\d{2}", start) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", end)):
+                    return self.send(400, {"error": "from/to must be YYYY-MM-DD"})
+                return self.send_csv(f"dream-{kind}-{start}_{end}.csv", export_rows(kind, start, end))
         self.send(404, {"error": "not found"})
 
     def do_POST(self):
