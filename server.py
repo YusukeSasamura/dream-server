@@ -419,5 +419,6 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     init()
-    print(f"dream-server on 127.0.0.1:{PORT}, K={K}", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+    BIND = os.environ.get("DREAM_BIND", "0.0.0.0")
+    print(f"dream-server on {BIND}:{PORT}, K={K}", flush=True)
+    ThreadingHTTPServer((BIND, PORT), H).serve_forever()
