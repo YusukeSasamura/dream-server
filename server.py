@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Dream — "Everyone's dreams" aggregate server.
 
-Stores only anonymous summaries (keywords, feelings, day, country, optional age band / gender)
-under a random install ID. Never stores dream text. Every number it returns is computed over
+Stores only anonymous summaries (keywords, feelings, day, country, optional age band / gender,
+and — with the 1.2 consent — the kinds of records a dream linked to, how many days earlier, how many
+records of each kind the day before, and a rough sleep band) under a random install ID. Never stores dream text. Every number it returns is computed over
 at least K different people; smaller groups are withheld.
 
 Standard library only. Listens on 127.0.0.1; put Caddy or nginx in front for HTTPS.
@@ -21,6 +22,25 @@ ADMIN_ORIGIN = os.environ.get("DREAM_ADMIN_ORIGIN", "https://iwakeupeverymorning
 AGES = {"", "10s", "20s", "30s", "40s", "50s+"}
 GENDERS = {"", "f", "m", "x"}
 FEELINGS = {"uneasy", "fear", "sad", "nostalgic", "calm", "joy", "anger", "love", "surprise"}
+LINK_KINDS = {"visit", "sleep", "calendar", "plan", "feeling", "thought", "dreamNote", "note", "screen",
+              "screenDigest", "photo", "video", "body", "activity"}
+COUNT_BANDS = {"0", "1-2", "3+"}
+# The day before a dream, only as kinds and rough bands (never titles, places, names, times or raw figures).
+DAY_SCHEMA = {
+    "visit": COUNT_BANDS, "calendar": COUNT_BANDS, "plan": COUNT_BANDS, "photo": COUNT_BANDS,
+    "feeling": COUNT_BANDS, "activity": COUNT_BANDS, "screen": COUNT_BANDS,
+    "sleep": {"<6h", "6-8h", "8h+"},
+    "move": {"0-1km", "1-5km", "5-20km", "20-100km", "100km+"},
+    "newplace": {"yes", "no"},
+    "wake": {"<6", "6-8", "8-10", "10+"},
+    "weekday": {"mon", "tue", "wed", "thu", "fri", "sat", "sun"},
+}
+DAY_LISTS = {
+    "plans": {"work", "social", "travel", "health", "study", "family", "other"},
+    "moods": FEELINGS,
+    "people": {"partner", "family", "friend", "work", "other"},
+}
+DAY_KEYS = set(DAY_SCHEMA) | set(DAY_LISTS)
 
 _lock = threading.Lock()
 _rate = {}
@@ -46,6 +66,48 @@ def init():
           day TEXT NOT NULL, scope TEXT NOT NULL, title_ja TEXT NOT NULL, title_en TEXT NOT NULL,
           PRIMARY KEY(day, scope, title_en));
         """)
+        cols = {r[1] for r in c.execute("PRAGMA table_info(entries)")}
+        if "links" not in cols:
+            c.execute("ALTER TABLE entries ADD COLUMN links TEXT NOT NULL DEFAULT '[]'")
+        if "dayinfo" not in cols:
+            c.execute("ALTER TABLE entries ADD COLUMN dayinfo TEXT NOT NULL DEFAULT '{}'")
+
+
+def clean_links(items):
+    out, seen = [], set()
+    for x in (items or [])[:12]:
+        if not isinstance(x, dict):
+            continue
+        k = str(x.get("kind", ""))
+        try:
+            d = max(0, min(14, int(x.get("days", 0))))
+        except (TypeError, ValueError):
+            continue
+        if k not in LINK_KINDS:
+            continue
+        w = clean_word(x.get("word", "")) if x.get("word") else ""
+        key = (k, d, w)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"kind": k, "days": d, "word": w})
+    return out[:10]
+
+
+def clean_day(d):
+    if not isinstance(d, dict):
+        return {}
+    out = {}
+    for k, allowed in DAY_SCHEMA.items():
+        if str(d.get(k, "")) in allowed:
+            out[k] = str(d[k])
+    for k, allowed in DAY_LISTS.items():
+        v = d.get(k)
+        if isinstance(v, list):
+            vals = sorted({str(x) for x in v[:10] if str(x) in allowed})
+            if vals:
+                out[k] = vals
+    return out
 
 
 def clean_word(w):
@@ -111,7 +173,7 @@ def summary(q):
 
 # ---- Admin export (token required). Rows carry no dream text, names or IPs; the install ID is
 # replaced by a one-way pseudonym so exported files can't be matched back to a device.
-EXPORT_KINDS = ("entries", "daily", "words", "feelings", "countries", "demographics")
+EXPORT_KINDS = ("entries", "daily", "words", "feelings", "countries", "demographics", "links", "days")
 
 
 def pseudo(dev):
@@ -120,13 +182,49 @@ def pseudo(dev):
 
 def export_rows(kind, start, end):
     with db() as c:
-        rows = c.execute("SELECT device, day, country, age, gender, words, feelings, created FROM entries "
+        rows = c.execute("SELECT device, day, country, age, gender, words, feelings, links, dayinfo, created FROM entries "
                          "WHERE day BETWEEN ? AND ? ORDER BY day, device", (start, end)).fetchall()
     if kind == "entries":
-        yield ["day", "person", "country", "age", "gender", "words", "feelings"]
+        yield ["day", "person", "country", "age", "gender", "words", "feelings", "links"] + sorted(DAY_KEYS)
         for r in rows:
+            di = json.loads(r["dayinfo"] or "{}")
+            links = " / ".join(f'{l["kind"]}:{l["days"]}d' + (f':{l["word"]}' if l["word"] else "") for l in json.loads(r["links"] or "[]"))
             yield [r["day"], pseudo(r["device"]), r["country"], r["age"], r["gender"],
-                   " / ".join(json.loads(r["words"])), " ".join(json.loads(r["feelings"]))]
+                   " / ".join(json.loads(r["words"])), " ".join(json.loads(r["feelings"])), links] + \
+                  [" ".join(di[k]) if isinstance(di.get(k), list) else di.get(k, "") for k in sorted(DAY_KEYS)]
+        return
+    if kind == "links":
+        groups = {}
+        for r in rows:
+            for l in json.loads(r["links"] or "[]"):
+                g = groups.setdefault((l["kind"], l["days"], l["word"]), {"people": set(), "dreams": 0, "feel": {}})
+                g["people"].add(r["device"]); g["dreams"] += 1
+                for f in json.loads(r["feelings"]):
+                    g["feel"][f] = g["feel"].get(f, 0) + 1
+        yield ["record_kind", "days_before", "dream_word", "people", "dreams", "top_feelings"]
+        for (k, d, w), g in sorted(groups.items(), key=lambda kv: (-kv[1]["dreams"], kv[0][0], kv[0][1])):
+            top = " ".join(f"{f}:{n}" for f, n in sorted(g["feel"].items(), key=lambda kv: -kv[1])[:3])
+            yield [k, d, w, len(g["people"]), g["dreams"], top]
+        return
+    if kind == "days":
+        # Which kinds of days come before which dreams: for each factor and band,
+        # how many dreams, and their most common feelings and words.
+        groups = {}
+        for r in rows:
+            di = json.loads(r["dayinfo"] or "{}")
+            pairs = [(f, x) for f, v in di.items() for x in (v if isinstance(v, list) else [v])]
+            for factor, b in pairs:
+                g = groups.setdefault((factor, b), {"people": set(), "dreams": 0, "feel": {}, "word": {}})
+                g["people"].add(r["device"]); g["dreams"] += 1
+                for f in json.loads(r["feelings"]):
+                    g["feel"][f] = g["feel"].get(f, 0) + 1
+                for w in json.loads(r["words"]):
+                    g["word"][w] = g["word"].get(w, 0) + 1
+        yield ["factor", "band", "people", "dreams", "top_feelings", "top_words"]
+        for (factor, b), g in sorted(groups.items()):
+            top_f = " ".join(f"{f}:{round(n / g['dreams'], 2)}" for f, n in sorted(g["feel"].items(), key=lambda kv: -kv[1])[:4])
+            top_w = " / ".join(f"{w}:{n}" for w, n in sorted(g["word"].items(), key=lambda kv: -kv[1])[:8])
+            yield [factor, b, len(g["people"]), g["dreams"], top_f, top_w]
         return
     if kind == "daily":
         first = {}
@@ -281,9 +379,13 @@ class H(BaseHTTPRequestHandler):
             gender = b.get("gender", "") if b.get("gender", "") in GENDERS else ""
             words = [w for w in (clean_word(x) for x in (b.get("words") or [])[:8]) if w][:6]
             feelings = [f for f in (b.get("feelings") or [])[:5] if f in FEELINGS][:3]
+            links = clean_links(b.get("links"))
+            dayinfo = clean_day(b.get("dayinfo"))
             with db() as c:
-                c.execute("INSERT OR REPLACE INTO entries VALUES(?,?,?,?,?,?,?,?)",
-                          (dev, day, country, age, gender, json.dumps(words, ensure_ascii=False), json.dumps(feelings), int(time.time())))
+                c.execute("INSERT OR REPLACE INTO entries(device, day, country, age, gender, words, feelings, created, links, dayinfo) "
+                          "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                          (dev, day, country, age, gender, json.dumps(words, ensure_ascii=False), json.dumps(feelings), int(time.time()),
+                           json.dumps(links, ensure_ascii=False), json.dumps(dayinfo)))
             return self.send(200, {"ok": True})
         if u.path == "/v1/forget":
             dev = self.device(b.get("device"))
