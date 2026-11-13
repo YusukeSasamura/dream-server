@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow"><title>Dream 管理</title>
+<style>
+body{font-family:-apple-system,"Hiragino Sans",sans-serif;background:#fff;color:#111;max-width:640px;margin:40px auto;padding:0 16px}
+h1{font-size:22px;font-weight:600}label{display:block;font-size:13px;color:#555;margin:14px 0 6px}
+input{font:inherit;padding:10px;border:1px solid #ccc;border-radius:8px;width:100%;box-sizing:border-box}
+.row{display:flex;gap:10px}.row>div{flex:1}button{font:inherit;padding:10px 14px;border:1px solid #111;background:#fff;border-radius:8px;cursor:pointer;margin:6px 6px 0 0}
+button:hover{background:#111;color:#fff}#ov{margin:20px 0;font-size:14px;line-height:1.8}#msg{color:#b00;font-size:13px}small{color:#777}
+</style></head><body>
+<h1>Dream 管理：匿名データの書き出し</h1>
+<small>「みんなの夢」に参加した人の匿名データ（テーマのことば・気持ち・日付・国・年代・性別）だけです。夢の本文や名前は含まれません。</small>
+<label>管理トークン（このタブを閉じると消えます）</label><input id="tok" type="password" autocomplete="off">
+<div class="row"><div><label>開始日</label><input id="from" type="date"></div><div><label>終了日</label><input id="to" type="date"></div></div>
+<div><button onclick="ov()">概要を見る</button></div>
+<div id="ov"></div>
+<div>
+<button onclick="dl('entries')">全件（1夢1行）</button><button onclick="dl('daily')">日別</button><button onclick="dl('words')">ことば</button>
+<button onclick="dl('feelings')">気持ち</button><button onclick="dl('countries')">国</button><button onclick="dl('demographics')">年代・性別</button>
+</div><p id="msg"></p>
+<script>
+const API='https://api.iwakeupeverymorninginordertodream.com';
+const $=id=>document.getElementById(id);
+try{$('tok').value=sessionStorage.getItem('t')||''}catch(e){}
+$('tok').oninput=()=>{try{sessionStorage.setItem('t',$('tok').value)}catch(e){}};
+$('to').value=new Date().toISOString().slice(0,10);
+function h(){return{'X-Admin-Token':$('tok').value.trim()}}
+async function ov(){$('msg').textContent='';try{const r=await fetch(API+'/v1/admin/overview',{headers:h()});if(!r.ok)throw new Error(r.status==403?'トークンが違います':'エラー '+r.status);const j=await r.json();
+$('ov').innerHTML=`参加者 <b>${j.people}</b>人 ／ 夢 <b>${j.dreams}</b>件<br>直近7日：${j.last7_people}人・${j.last7_dreams}件<br>期間：${j.first_day||'-'} 〜 ${j.last_day||'-'}<br><small>※ 外部に出す統計は ${j.k_public}人以上のまとまりだけにしてください</small>`}catch(e){$('msg').textContent=e.message}}
+async function dl(k){$('msg').textContent='';const q=new URLSearchParams({kind:k});if($('from').value)q.set('from',$('from').value);if($('to').value)q.set('to',$('to').value);
+try{const r=await fetch(API+'/v1/admin/export?'+q,{headers:h()});if(!r.ok)throw new Error(r.status==403?'トークンが違います':'エラー '+r.status);
+const b=await r.blob();const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=`dream-${k}-${$('from').value||'all'}_${$('to').value}.csv`;a.click();URL.revokeObjectURL(a.href)}catch(e){$('msg').textContent=e.message}}
+</script></body></html>
